@@ -1,0 +1,38 @@
+---
+# Copy this file outside the repository, fill every blank secret value, then
+# create Secret/saw-agent-vars from it as the vars.yml key.
+saw_vm_role: agent
+namespace: "${NS}"
+hostname: saw-agent
+provisioning_user: openshell
+sandbox_name: openclaw-saw
+userport: 18789
+
+oidc_issuer: https://openshell-keycloak-ingress-keycloak.apps.cluster-dbzdl.dyn.redhatworkshops.io/realms/openshell
+oidc_realm: openshell
+oidc_client_id: openshell-cli
+dashboard_client_id: openshell-dashboard
+keycloak_ca_pem: ""
+
+openclaw_route_origin: "https://saw-agent-userport.${NS}.dal.dev.cirrus.ibm.com"
+openclaw_proxy_redirect_url: "https://saw-agent-userport.${NS}.dal.dev.cirrus.ibm.com/oauth2/callback"
+openclaw_proxy_allowed_users:
+  - alice
+
+forge_ui_enabled: true
+forge_ui_port: 18090
+forge_ui_container_port: 8080
+forge_ui_image: "quay.io/rcook/rh-forge-ui:demo1-amd64"
+
+inference_provider: glm
+inference_model: rits/zai-org/glm-5-2-fp8
+inference_api_key: ""
+inference_endpoint_url: "https://saw-integ.${NS}.svc.cluster.local:18083/v1"
+inference_https_proxy: ""
+integration_proxy_ca_pem: ""
+
+openshell_version: 0.0.103
+sandbox_image: quay.io/rh-ai-quickstart/openclaw-openshell@sha256:f6226599b9bff9475bb0597e49d1612866597e319a0a63ac59e8eea7f864f32c
+gateway_image: ghcr.io/nvidia/openshell/gateway:0.0.103
+supervisor_image: ghcr.io/nvidia/openshell/supervisor:0.0.103
+openclaw_proxy_image: quay.io/oauth2-proxy/oauth2-proxy@sha256:10a1165743a192e1940b4708fb9647027185ce11a681a1c5519b442ff7f1f561

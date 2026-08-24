@@ -1,0 +1,14 @@
+---
+# Copy this file outside the repository, fill every blank secret value, then
+# create Secret/saw-integ-vars from it as the vars.yml key.
+saw_vm_role: integration
+namespace: "${NS}"
+hostname: saw-integ
+
+integration_proxy_port: 18083
+integration_proxy_upstream_url: https://ete-litellm.ai-models.vpc.res.ibm.com/v1
+integration_proxy_expected_bearer: ""
+integration_proxy_openai_key: ""
+integration_proxy_ca_pem: ""
+integration_proxy_tls_cert_pem: ""
+integration_proxy_tls_key_pem: ""

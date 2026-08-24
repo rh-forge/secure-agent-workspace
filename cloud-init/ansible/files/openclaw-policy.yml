@@ -1,0 +1,23 @@
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /etc
+    - /proc
+    - /dev/urandom
+    - /app
+    - /opt
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+    - /dev/pts
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: "65532"
+  run_as_group: "65532"

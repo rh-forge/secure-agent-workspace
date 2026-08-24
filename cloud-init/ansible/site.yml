@@ -1,0 +1,285 @@
+---
+- name: Dual-VM Secure Agent Workspace role dispatcher
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+  vars:
+    saw_vm_role_required: "{{ saw_vm_role | mandatory }}"
+    integration_proxy_port_cfg: "{{ integration_proxy_port | default(18083) }}"
+    integration_proxy_upstream_url_cfg: "{{ integration_proxy_upstream_url | default('https://api.openai.com/v1') }}"
+    integration_proxy_openai_key_cfg: "{{ integration_proxy_openai_key | default('') }}"
+
+  tasks:
+    - name: Validate VM role
+      ansible.builtin.assert:
+        that:
+          - saw_vm_role_required in ['agent', 'integration']
+        fail_msg: "saw_vm_role must be agent or integration"
+
+    - name: Install shared packages
+      ansible.builtin.dnf:
+        name: "{{ ['ca-certificates', 'curl', 'jq', 'python3', 'qemu-guest-agent'] if saw_vm_role_required == 'agent' else ['ca-certificates', 'python3', 'qemu-guest-agent', 'xfsprogs'] }}"
+        state: present
+      register: shared_pkg_install
+      retries: 5
+      delay: 15
+      until: shared_pkg_install is succeeded
+
+    - name: Enable qemu guest agent
+      ansible.builtin.systemd:
+        name: qemu-guest-agent.service
+        enabled: true
+        state: started
+      failed_when: false
+
+    - name: Trust integration proxy CA on agent VM
+      when: saw_vm_role_required == 'agent'
+      block:
+        - name: Install integration proxy CA
+          ansible.builtin.copy:
+            dest: /etc/pki/ca-trust/source/anchors/saw-integration-ca.crt
+            mode: "0644"
+            content: "{{ integration_proxy_ca_pem }}"
+
+        - name: Update system CA trust
+          ansible.builtin.command: update-ca-trust
+          changed_when: true
+
+        - name: Export CA path for login shells
+          ansible.builtin.copy:
+            dest: /etc/profile.d/saw-integration-ca.sh
+            mode: "0644"
+            content: |
+              export NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/saw-integration-ca.crt
+              export REQUESTS_CA_BUNDLE=/etc/pki/ca-trust/source/anchors/saw-integration-ca.crt
+              export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt
+
+        - name: Run vendored agent provisioning playbook
+          ansible.builtin.command: >
+            ansible-playbook -i localhost,
+            {{ playbook_dir }}/agent.yml
+            -e @/etc/openshell-saw/vars.yml
+          changed_when: true
+
+    - name: Configure integration inference proxy on saw-integ
+      when: saw_vm_role_required == 'integration'
+      block:
+        - name: Locate persistent integration disk
+          ansible.builtin.shell: |
+            set -euo pipefail
+            lsblk -rpno NAME,SERIAL | awk '$2=="SAWINTEGPERSIST"{print $1;exit}'
+          args:
+            executable: /bin/bash
+          register: saw_persist_device
+          changed_when: false
+          retries: 12
+          delay: 5
+          until: saw_persist_device.stdout | length > 0
+
+        - name: Check persistent integration disk filesystem
+          ansible.builtin.command: "blkid {{ saw_persist_device.stdout }}"
+          register: saw_persist_blkid
+          changed_when: false
+          failed_when: false
+
+        - name: Format blank persistent integration disk
+          ansible.builtin.command: "mkfs.xfs -f {{ saw_persist_device.stdout }}"
+          when: saw_persist_blkid.rc != 0
+          changed_when: true
+
+        - name: Read persistent integration disk UUID
+          ansible.builtin.command: "blkid -s UUID -o value {{ saw_persist_device.stdout }}"
+          register: saw_persist_uuid
+          changed_when: false
+
+        - name: Ensure persistent integration mount point exists
+          ansible.builtin.file:
+            path: /var/lib/saw-persist
+            state: directory
+            mode: "0750"
+
+        - name: Persist integration disk mount
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^[^#]\S+\s+/var/lib/saw-persist\s+'
+            line: "UUID={{ saw_persist_uuid.stdout }} /var/lib/saw-persist xfs defaults,nofail 0 2"
+            create: true
+            mode: "0644"
+
+        - name: Mount persistent integration disk
+          ansible.builtin.command: mount /var/lib/saw-persist
+          register: saw_persist_mount
+          changed_when: saw_persist_mount.rc == 0
+          failed_when: saw_persist_mount.rc != 0 and 'already mounted' not in saw_persist_mount.stderr
+
+        - name: Ensure persistent integration bind sources exist
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0750"
+          loop:
+            - /var/lib/saw-persist/etc-saw-integration
+            - /var/lib/saw-persist/var-lib-saw-integration
+
+        - name: Ensure integration bind targets exist
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0750"
+          loop:
+            - /etc/saw-integration
+            - /var/lib/saw-integration
+
+        - name: Persist integration bind mounts
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: "^[^#]\\S+\\s+{{ item.target | regex_escape() }}\\s+"
+            line: "{{ item.source }} {{ item.target }} none bind,nofail 0 0"
+            create: true
+            mode: "0644"
+          loop:
+            - { source: /var/lib/saw-persist/etc-saw-integration, target: /etc/saw-integration }
+            - { source: /var/lib/saw-persist/var-lib-saw-integration, target: /var/lib/saw-integration }
+
+        - name: Mount integration bind targets
+          ansible.builtin.command: "mount {{ item }}"
+          register: saw_persist_bind_mount
+          changed_when: saw_persist_bind_mount.rc == 0
+          failed_when: saw_persist_bind_mount.rc != 0 and 'already mounted' not in saw_persist_bind_mount.stderr
+          loop:
+            - /etc/saw-integration
+            - /var/lib/saw-integration
+
+        - name: Ensure integration directories exist
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            mode: "{{ item.mode }}"
+          loop:
+            - { path: /opt/saw-integration, mode: "0755" }
+            - { path: /etc/saw-integration, mode: "0750" }
+            - { path: /etc/saw-integration/tls, mode: "0750" }
+
+        - name: Install integration proxy script
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/files/openai_forwarder.py"
+            dest: /opt/saw-integration/openai_forwarder.py
+            remote_src: true
+            mode: "0755"
+
+        - name: Install integration proxy CA
+          ansible.builtin.copy:
+            dest: /etc/saw-integration/tls/ca.crt
+            mode: "0644"
+            content: "{{ integration_proxy_ca_pem }}"
+
+        - name: Install integration proxy TLS certificate
+          ansible.builtin.copy:
+            dest: /etc/saw-integration/tls/server.crt
+            mode: "0644"
+            content: "{{ integration_proxy_tls_cert_pem }}"
+
+        - name: Install integration proxy TLS key
+          ansible.builtin.copy:
+            dest: /etc/saw-integration/tls/server.key
+            mode: "0600"
+            content: "{{ integration_proxy_tls_key_pem }}"
+          no_log: true
+
+        - name: Inspect canonical OpenAI credential file
+          ansible.builtin.stat:
+            path: /etc/saw-integration/openai.key
+          register: integration_openai_key_file
+          no_log: true
+
+        - name: Initialize canonical OpenAI credential file when absent or empty
+          ansible.builtin.copy:
+            dest: /etc/saw-integration/openai.key
+            mode: "0600"
+            owner: root
+            group: root
+            content: "{{ integration_proxy_openai_key_cfg }}"
+            force: true
+          when: (not integration_openai_key_file.stat.exists) or ((integration_openai_key_file.stat.size | default(0) | int) == 0)
+          no_log: true
+
+        - name: Write integration proxy environment
+          ansible.builtin.copy:
+            dest: /etc/saw-integration/proxy.env
+            mode: "0600"
+            content: |
+              INTEGRATION_PROXY_EXPECTED_BEARER={{ integration_proxy_expected_bearer }}
+              OPENAI_API_KEY_FILE=/etc/saw-integration/openai.key
+              OPENAI_UPSTREAM_BASE_URL={{ integration_proxy_upstream_url_cfg }}
+              INTEGRATION_PROXY_PORT={{ integration_proxy_port_cfg }}
+              INTEGRATION_PROXY_TLS_CERT=/etc/saw-integration/tls/server.crt
+              INTEGRATION_PROXY_TLS_KEY=/etc/saw-integration/tls/server.key
+          no_log: true
+
+        - name: Install integration proxy systemd unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/saw-openai-forwarder.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=SAW OpenAI-compatible integration proxy
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              EnvironmentFile=/etc/saw-integration/proxy.env
+              ExecStart=/usr/bin/python3 /opt/saw-integration/openai_forwarder.py
+              Restart=on-failure
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+
+        - name: Enable and start integration proxy
+          ansible.builtin.systemd:
+            name: saw-openai-forwarder.service
+            daemon_reload: true
+            enabled: true
+            state: restarted
+
+        - name: Check integration proxy process health
+          ansible.builtin.shell: |
+            set -euo pipefail
+            /usr/bin/python3 - <<'PY'
+            import ssl
+            import urllib.request
+
+            context = ssl.create_default_context(cafile="/etc/saw-integration/tls/ca.crt")
+            with urllib.request.urlopen(
+                "https://127.0.0.1:{{ integration_proxy_port_cfg }}/healthz",
+                context=context,
+                timeout=10,
+            ) as response:
+                if response.status != 200:
+                    raise SystemExit(f"unexpected health status {response.status}")
+            PY
+          changed_when: false
+
+        - name: Check integration proxy readiness before provider injection
+          ansible.builtin.shell: |
+            set -euo pipefail
+            /usr/bin/python3 - <<'PY'
+            import ssl
+            import urllib.error
+            import urllib.request
+
+            context = ssl.create_default_context(cafile="/etc/saw-integration/tls/ca.crt")
+            try:
+                with urllib.request.urlopen(
+                    "https://127.0.0.1:{{ integration_proxy_port_cfg }}/readyz",
+                    context=context,
+                    timeout=10,
+                ) as response:
+                    print(response.status)
+            except urllib.error.HTTPError as exc:
+                print(exc.code)
+            PY
+          register: integration_readyz
+          changed_when: false
+          failed_when: integration_readyz.stdout not in ['200', '503']

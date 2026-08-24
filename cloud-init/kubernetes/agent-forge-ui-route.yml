@@ -1,0 +1,20 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: saw-agent-forge-ui
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/name: secure-agent-workspace
+    app.kubernetes.io/component: saw-agent
+    app.kubernetes.io/part-of: forge-ui-preview
+spec:
+  host: saw-agent-forge-ui.${NS}.dal.dev.cirrus.ibm.com
+  port:
+    targetPort: forgeui
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: saw-agent
+    weight: 100

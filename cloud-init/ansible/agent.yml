@@ -1,0 +1,1387 @@
+---
+- name: OpenShell Secure Agent Workspace provisioning
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+  vars:
+    # The cloud-init contract creates this unprivileged service account.
+    user_name: "{{ provisioning_user | mandatory }}"
+    provider_map:
+      openai:    { type: openai,      key: OPENAI_API_KEY }
+      glm:       { type: openai,      key: OPENAI_API_KEY }
+    inference_provider_cfg: "{{ inference_provider | mandatory }}"
+    inference_model_cfg: "{{ inference_model | mandatory }}"
+    inference_api_key_cfg: "{{ inference_api_key | mandatory }}"
+    inference_endpoint_url_cfg: "{{ inference_endpoint_url | mandatory }}"
+    inference_https_proxy_cfg: "{{ inference_https_proxy | default('') }}"
+    provider_sel: "{{ provider_map[inference_provider_cfg] | mandatory }}"
+    inference_provider_name: "inference-{{ inference_provider_cfg }}"
+    trusted_sandbox_image_cfg: "localhost/saw-openclaw-trusted:saw-integ-vm"
+    gw_name: openshell
+    mtls_gw: openshell-local
+    openclaw_route_origin_cfg: "{{ openclaw_route_origin | mandatory }}"
+    openclaw_proxy_enabled_cfg: true
+    openclaw_proxy_port_cfg: "{{ userport | mandatory }}"
+    openclaw_forward_port_cfg: 18788
+    openclaw_home_host_path: "{{ user_home }}/.local/share/openshell/openclaw-home"
+    openclaw_proxy_image_cfg: "{{ openclaw_proxy_image | mandatory }}"
+    openclaw_proxy_redirect_url_cfg: "{{ openclaw_proxy_redirect_url | default(openclaw_route_origin_cfg ~ '/oauth2/callback') }}"
+    forge_ui_enabled_cfg: "{{ forge_ui_enabled | default(false) }}"
+    forge_ui_port_cfg: "{{ forge_ui_port | default(18090) }}"
+    forge_ui_container_port_cfg: "{{ forge_ui_container_port | default(8080) }}"
+    forge_ui_image_cfg: "{{ forge_ui_image | default(\"\") }}"
+    keycloak_ca_pem_cfg: "{{ keycloak_ca_pem | default('') }}"
+    # Encode the complete patch before it crosses the saw-integ nested shell parsers
+    # (host bash -> sandbox /bin/sh). This preserves JSON arrays exactly.
+    openclaw_trusted_proxy_patch_b64: >-
+      {{
+        {
+          'gateway': {
+            'auth': {
+              'mode': 'trusted-proxy',
+              'trustedProxy': {
+                'userHeader': 'x-forwarded-preferred-username',
+                'requiredHeaders': ['x-forwarded-proto', 'x-forwarded-host'],
+                'allowUsers': (openclaw_proxy_allowed_users | mandatory),
+                'allowLoopback': true,
+                'deviceAutoApprove': {
+                  'enabled': true,
+                  'scopes': (openclaw_proxy_auto_approve_scopes | default([
+                    'operator.admin',
+                    'operator.approvals',
+                    'operator.pairing',
+                    'operator.questions',
+                    'operator.read',
+                    'operator.talk.secrets',
+                    'operator.write'
+                  ]))
+                }
+              }
+            },
+            'trustedProxies': ['127.0.0.1', '::1'],
+            'controlUi': {
+              'allowedOrigins': [openclaw_route_origin_cfg]
+            }
+          }
+        } | to_json | b64encode
+      }}
+    # Preserve the live-good OpenAI-compatible completions metadata for the
+    # approved model. The gateway reaches the integration VM through
+    # OpenShell's in-sandbox inference route; using the Responses shape here
+    # caused OpenClaw to reject UI requests as schema/tool payload failures.
+    openclaw_known_openai_model_catalog:
+      gpt-5.6-sol:
+        id: "{{ inference_model_cfg }}"
+        name: "{{ inference_model_cfg }} (Custom Provider)"
+        api: openai-completions
+        reasoning: false
+        input: [text, image]
+        contextWindow: 128000
+        maxTokens: 4096
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+      rits/zai-org/glm-5-2-fp8:
+        id: "{{ inference_model_cfg }}"
+        name: GLM 5.2 FP8
+        api: openai-completions
+        reasoning: false
+        input: [text]
+        contextWindow: 128000
+        maxTokens: 4096
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+    openclaw_known_model_patch_b64: >-
+      {{
+        {
+          'agents': {
+            'defaults': {
+              'model': {
+                'primary': inference_provider_cfg ~ '/' ~ inference_model_cfg
+              },
+              'models': {
+                (inference_provider_cfg ~ '/' ~ inference_model_cfg): {}
+              }
+            }
+          },
+          'models': {
+            'providers': {
+              (inference_provider_cfg): {
+                'baseUrl': 'https://inference.local/v1',
+                'api': 'openai-completions',
+                'models': [
+                  openclaw_known_openai_model_catalog.get(inference_model_cfg, {})
+                ]
+              }
+            }
+          }
+        } | to_json | b64encode
+      }}
+
+  tasks:
+    # Self-heal a flaky cloud-init dnf: reinstall (idempotent) with retries so a
+    # single transient mirror/network hiccup doesn't break the whole run.
+    - name: Refresh and enable RHEL package repositories before package install
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if command -v subscription-manager >/dev/null 2>&1; then
+          subscription-manager refresh || true
+          subscription-manager repos \
+            --enable=rhel-9-for-x86_64-baseos-rpms \
+            --enable=rhel-9-for-x86_64-appstream-rpms || true
+        fi
+        dnf clean all
+      args:
+        executable: /bin/bash
+      register: dnf_repo_bootstrap
+      changed_when: false
+      retries: 5
+      delay: 15
+      until: dnf_repo_bootstrap.rc == 0
+
+    - name: Refresh DNF metadata before package install
+      ansible.builtin.command:
+        cmd: dnf makecache --refresh
+      register: dnf_makecache
+      changed_when: false
+      retries: 5
+      delay: 15
+      until: dnf_makecache.rc == 0
+
+    - name: Wait for required RHEL packages to become available
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dnf -q makecache --refresh
+        for pkg in \
+          ansible-core podman fuse-overlayfs slirp4netns \
+          curl jq qemu-guest-agent openssh-clients openssh-server \
+          binutils xfsprogs
+        do
+          dnf -q list "${pkg}" >/dev/null
+        done
+      args:
+        executable: /bin/bash
+      register: dnf_package_availability
+      changed_when: false
+      retries: 30
+      delay: 20
+      until: dnf_package_availability.rc == 0
+
+    - name: Ensure required packages are installed
+      ansible.builtin.dnf:
+        name:
+          - ansible-core
+          - podman
+          - fuse-overlayfs
+          - slirp4netns
+          - curl
+          - jq
+          - qemu-guest-agent
+          - openssh-clients
+          - openssh-server
+          - binutils
+          - xfsprogs
+        enablerepo:
+          - rhel-9-for-x86_64-baseos-rpms
+          - rhel-9-for-x86_64-appstream-rpms
+        update_cache: true
+        state: present
+      register: pkg_install
+      retries: 10
+      delay: 20
+      until: pkg_install is succeeded
+
+    - name: Install optional troubleshooting packages when available
+      ansible.builtin.dnf:
+        name:
+          - telnet
+          - git
+          - lsof
+          - nodejs
+        enablerepo:
+          - rhel-9-for-x86_64-baseos-rpms
+          - rhel-9-for-x86_64-appstream-rpms
+        skip_broken: true
+        state: present
+      register: optional_pkg_install
+      failed_when: false
+
+    - name: Resolve target user account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ user_name }}"
+
+    - name: Set user facts
+      ansible.builtin.set_fact:
+        user_uid: "{{ ansible_facts.getent_passwd[user_name][1] }}"
+        user_home: "{{ ansible_facts.getent_passwd[user_name][4] }}"
+
+    - name: Set user runtime environment
+      ansible.builtin.set_fact:
+        user_env:
+          XDG_RUNTIME_DIR: "/run/user/{{ user_uid }}"
+          DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ user_uid }}/bus"
+          # become_user tasks otherwise get sudo's minimal PATH, which omits
+          # /usr/local/bin where the openshell CLI is installed. Set an explicit
+          # PATH so bare `openshell` resolves for all become_user tasks.
+          PATH: "{{ user_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    - name: Define saw-agent persistent disks
+      ansible.builtin.set_fact:
+        saw_agent_persistent_disks:
+          - serial: SAWAGENTSTATE
+            mount: /var/lib/saw-agent-state
+          - serial: SAWAGENTASSETS
+            mount: /var/lib/saw-agent-assets
+
+    - name: Define saw-agent persistent bind mounts
+      ansible.builtin.set_fact:
+        saw_agent_state_bind_mounts:
+          - source: /var/lib/saw-agent-state/etc-openshell
+            target: /etc/openshell
+            owner: root
+            group: root
+          - source: /var/lib/saw-agent-state/home-config-openshell
+            target: "{{ user_home }}/.config/openshell"
+            owner: "{{ user_name }}"
+            group: "{{ user_name }}"
+          - source: /var/lib/saw-agent-state/home-local-state-openshell
+            target: "{{ user_home }}/.local/state/openshell"
+            owner: "{{ user_name }}"
+            group: "{{ user_name }}"
+          - source: /var/lib/saw-agent-state/home-local-share-openshell
+            target: "{{ user_home }}/.local/share/openshell"
+            owner: "{{ user_name }}"
+            group: "{{ user_name }}"
+        saw_agent_asset_bind_mounts:
+          - source: /var/lib/saw-agent-assets/home-local-share-containers
+            target: "{{ user_home }}/.local/share/containers"
+            owner: "{{ user_name }}"
+            group: "{{ user_name }}"
+
+    - name: Combine saw-agent persistent bind mounts
+      ansible.builtin.set_fact:
+        saw_agent_persistent_bind_mounts: "{{ saw_agent_state_bind_mounts + saw_agent_asset_bind_mounts }}"
+
+    - name: Locate saw-agent persistent disks
+      ansible.builtin.shell: |
+        set -euo pipefail
+        lsblk -rpno NAME,SERIAL | awk '$2=="{{ item.serial }}"{print $1;exit}'
+      args:
+        executable: /bin/bash
+      loop: "{{ saw_agent_persistent_disks }}"
+      register: saw_agent_persistent_device_lookup
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: saw_agent_persistent_device_lookup.stdout | length > 0
+
+    - name: Build saw-agent persistent disk facts
+      ansible.builtin.set_fact:
+        saw_agent_persistent_devices: "{{ saw_agent_persistent_devices | default([]) + [item.item | combine({'device': item.stdout})] }}"
+      loop: "{{ saw_agent_persistent_device_lookup.results }}"
+
+    - name: Check saw-agent persistent disk filesystems
+      ansible.builtin.command: "blkid {{ item.device }}"
+      loop: "{{ saw_agent_persistent_devices }}"
+      register: saw_agent_persistent_blkid
+      changed_when: false
+      failed_when: false
+
+    - name: Format blank saw-agent persistent disks
+      ansible.builtin.command: "mkfs.xfs -f {{ item.item.device }}"
+      loop: "{{ saw_agent_persistent_blkid.results }}"
+      when: item.rc != 0
+      changed_when: true
+
+    - name: Read saw-agent persistent disk UUIDs
+      ansible.builtin.command: "blkid -s UUID -o value {{ item.device }}"
+      loop: "{{ saw_agent_persistent_devices }}"
+      register: saw_agent_persistent_uuid_lookup
+      changed_when: false
+
+    - name: Ensure saw-agent persistent mount points exist
+      ansible.builtin.file:
+        path: "{{ item.mount }}"
+        state: directory
+        mode: "0750"
+      loop: "{{ saw_agent_persistent_devices }}"
+
+    - name: Persist saw-agent disk mounts
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^[^#]\\S+\\s+{{ item.item.mount | regex_escape() }}\\s+"
+        line: "UUID={{ item.stdout }} {{ item.item.mount }} xfs defaults,nofail 0 2"
+        create: true
+        mode: "0644"
+      loop: "{{ saw_agent_persistent_uuid_lookup.results }}"
+
+    - name: Mount saw-agent persistent disks
+      ansible.builtin.command: "mount {{ item.mount }}"
+      loop: "{{ saw_agent_persistent_devices }}"
+      register: saw_agent_persistent_mount
+      changed_when: saw_agent_persistent_mount.rc == 0
+      failed_when: saw_agent_persistent_mount.rc != 0 and 'already mounted' not in saw_agent_persistent_mount.stderr
+
+    - name: Ensure saw-agent persistent bind sources exist
+      ansible.builtin.file:
+        path: "{{ item.source }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "0750"
+      loop: "{{ saw_agent_persistent_bind_mounts }}"
+
+    - name: Ensure saw-agent persistent bind targets exist
+      ansible.builtin.file:
+        path: "{{ item.target }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "0750"
+      loop: "{{ saw_agent_persistent_bind_mounts }}"
+
+    - name: Persist saw-agent bind mounts
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^[^#]\\S+\\s+{{ item.target | regex_escape() }}\\s+"
+        line: "{{ item.source }} {{ item.target }} none bind,nofail 0 0"
+        create: true
+        mode: "0644"
+      loop: "{{ saw_agent_persistent_bind_mounts }}"
+
+    - name: Mount saw-agent bind targets
+      ansible.builtin.command: "mount {{ item.target }}"
+      loop: "{{ saw_agent_persistent_bind_mounts }}"
+      register: saw_agent_persistent_bind_mount
+      changed_when: saw_agent_persistent_bind_mount.rc == 0
+      failed_when: saw_agent_persistent_bind_mount.rc != 0 and 'already mounted' not in saw_agent_persistent_bind_mount.stderr
+
+    - name: Ensure persistent OpenClaw home exists
+      ansible.builtin.file:
+        path: "{{ openclaw_home_host_path }}"
+        state: directory
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        # The sandbox process identity does not necessarily match the host
+        # openshell UID/GID. Keep the mount narrowly scoped to OpenClaw home,
+        # but make the mounted directory writable inside the sandbox.
+        mode: "0777"
+
+    # === [1/8] Podman socket + user manager ===
+    # Rootless podman needs the cpu/cpuset/io controllers delegated to the user
+    # slice; systemd does not delegate them by default, so sandbox creation
+    # fails with "controller `cpu` is not available under .../user-<uid>.slice".
+    # The drop-in must be in place before user@<uid>.service first starts.
+    - name: Ensure user@.service systemd drop-in dir exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/user@.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Delegate cgroup controllers to user services
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/user@.service.d/delegate.conf
+        mode: "0644"
+        content: |
+          [Service]
+          Delegate=cpu cpuset io memory pids
+      register: cgroup_delegate
+
+    - name: Reload systemd to apply delegation drop-in
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: cgroup_delegate is changed
+
+    - name: Enable linger for user
+      ansible.builtin.command: "loginctl enable-linger {{ user_name }}"
+      args:
+        creates: "/var/lib/systemd/linger/{{ user_name }}"
+
+    - name: Start user systemd manager
+      ansible.builtin.systemd:
+        name: "user@{{ user_uid }}.service"
+        state: started
+
+    # If the manager was already running (e.g. a prior deploy or an SSH login)
+    # it won't have picked up the new delegation; restart it once when the
+    # drop-in changed so the cpu controller becomes available to podman.
+    - name: Restart user manager so cgroup delegation takes effect
+      ansible.builtin.systemd:
+        name: "user@{{ user_uid }}.service"
+        state: restarted
+      when: cgroup_delegate is changed
+
+    - name: Wait for user D-Bus socket
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ user_uid }}/bus"
+        timeout: 90
+
+    - name: Enable + start rootless podman socket
+      ansible.builtin.systemd:
+        name: podman.socket
+        scope: user
+        enabled: true
+        state: started
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+
+    - name: Wait for podman user socket
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ user_uid }}/podman/podman.sock"
+        timeout: 15
+      ignore_errors: true
+
+    - name: Build sandbox image with integration CA trust
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - "{{ playbook_dir }}/files/build-trusted-sandbox-image.sh"
+          - "{{ sandbox_image }}"
+          - "{{ trusted_sandbox_image_cfg }}"
+          - /etc/pki/ca-trust/source/anchors/saw-integration-ca.crt
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      changed_when: true
+
+    - name: Validate Forge UI image when preview is enabled
+      ansible.builtin.assert:
+        that:
+          - forge_ui_image_cfg | length > 0
+        fail_msg: "forge_ui_image must be set when forge_ui_enabled is true"
+      when: forge_ui_enabled_cfg | bool
+
+    - name: Ensure user Forge UI runtime dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0755"
+      loop:
+        - "{{ user_home }}/.config/systemd/user"
+        - "{{ user_home }}/.local/bin"
+      when: forge_ui_enabled_cfg | bool
+
+    - name: Write Forge UI launch script
+      ansible.builtin.copy:
+        dest: "{{ user_home }}/.local/bin/start-forge-ui"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          podman pull "{{ forge_ui_image_cfg }}"
+          podman rm -f forge-ui >/dev/null 2>&1 || true
+
+          exec podman run --rm --name forge-ui \
+            -p 0.0.0.0:{{ forge_ui_port_cfg }}:{{ forge_ui_container_port_cfg }} \
+            "{{ forge_ui_image_cfg }}"
+      when: forge_ui_enabled_cfg | bool
+
+    - name: Write Forge UI systemd user unit
+      ansible.builtin.copy:
+        dest: "{{ user_home }}/.config/systemd/user/forge-ui.service"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Forge UI static preview
+          After=podman.socket
+          Wants=podman.socket
+
+          [Service]
+          Type=simple
+          ExecStart=%h/.local/bin/start-forge-ui
+          ExecStop=/usr/bin/podman stop -t 5 forge-ui
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=default.target
+      when: forge_ui_enabled_cfg | bool
+
+    - name: Enable + start Forge UI preview
+      ansible.builtin.systemd:
+        name: forge-ui.service
+        scope: user
+        enabled: true
+        state: started
+        daemon_reload: true
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      when: forge_ui_enabled_cfg | bool
+
+    - name: Wait for Forge UI readiness
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ forge_ui_port_cfg }}/"
+        status_code: [200]
+      register: forge_ui_health
+      until: forge_ui_health.status == 200
+      retries: 20
+      delay: 3
+      when: forge_ui_enabled_cfg | bool
+
+    # === [2/8] Gateway config files (env, toml, systemd unit) ===
+    - name: Ensure /etc/openshell exists
+      ansible.builtin.file:
+        path: /etc/openshell
+        state: directory
+        mode: "0750"
+
+    - name: Write gateway.env
+      ansible.builtin.copy:
+        dest: /etc/openshell/gateway.env
+        mode: "0644"
+        content: |
+          OPENSHELL_BIND_ADDRESS=0.0.0.0
+          OPENSHELL_SERVER_PORT=17670
+          OPENSHELL_DRIVERS=podman
+          OPENSHELL_SSH_GATEWAY_PORT=17670
+          OPENSHELL_TLS_CERT={{ user_home }}/.local/state/openshell/tls/server/tls.crt
+          OPENSHELL_TLS_KEY={{ user_home }}/.local/state/openshell/tls/server/tls.key
+          OPENSHELL_TLS_CLIENT_CA={{ user_home }}/.local/state/openshell/tls/ca.crt
+          OPENSHELL_CONFIG_FILE=/etc/openshell/gateway.toml
+          OPENSHELL_ENABLE_MTLS_AUTH=true
+
+    - name: Write mTLS bootstrap gateway config
+      ansible.builtin.copy:
+        dest: /etc/openshell/gateway.toml
+        mode: "0644"
+        content: |
+          [openshell.gateway.auth]
+          allow_unauthenticated_users = false
+
+          [openshell.drivers.podman]
+          enable_bind_mounts = true
+          {% if inference_https_proxy_cfg | length > 0 %}
+          https_proxy = "{{ inference_https_proxy_cfg }}"
+          {% endif %}
+
+    - name: Write gateway systemd user unit
+      ansible.builtin.copy:
+        dest: /usr/lib/systemd/user/openshell-gateway.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=OpenShell Gateway
+
+          [Service]
+          Type=simple
+          StateDirectory=openshell/gateway
+          Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls
+          EnvironmentFile=-%E/openshell/gateway.env
+          ExecStartPre=/usr/local/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal
+          ExecStart=/usr/local/bin/openshell-gateway
+          Restart=on-failure
+          RestartSec=5s
+          PrivateTmp=true
+          UMask=0077
+
+          [Install]
+          WantedBy=default.target
+
+    # === [3/8] Install OpenShell binaries (gateway/supervisor/CLI) ===
+    - name: Pull gateway image
+      ansible.builtin.command: "podman pull {{ gateway_image }}"
+      changed_when: true
+
+    - name: Create gateway container
+      ansible.builtin.command: "podman create {{ gateway_image }}"
+      register: gw_cid
+      changed_when: true
+
+    - name: Copy gateway binary out
+      ansible.builtin.command: "podman cp {{ gw_cid.stdout }}:/usr/local/bin/openshell-gateway /usr/local/bin/openshell-gateway"
+      args:
+        creates: /usr/local/bin/openshell-gateway
+
+    - name: Remove gateway container
+      ansible.builtin.command: "podman rm {{ gw_cid.stdout }}"
+      changed_when: true
+
+    - name: Ensure gateway binary is executable
+      ansible.builtin.file:
+        path: /usr/local/bin/openshell-gateway
+        mode: "0755"
+
+    - name: Pull supervisor image
+      ansible.builtin.command: "podman pull {{ supervisor_image }}"
+      changed_when: true
+
+    - name: Create supervisor container
+      ansible.builtin.command: "podman create {{ supervisor_image }}"
+      register: sup_cid
+      changed_when: true
+
+    - name: Copy supervisor binary out
+      ansible.builtin.command: "podman cp {{ sup_cid.stdout }}:/openshell-sandbox /usr/local/bin/openshell-supervisor"
+      args:
+        creates: /usr/local/bin/openshell-supervisor
+
+    - name: Remove supervisor container
+      ansible.builtin.command: "podman rm {{ sup_cid.stdout }}"
+      changed_when: true
+
+    - name: Ensure supervisor binary is executable
+      ansible.builtin.file:
+        path: /usr/local/bin/openshell-supervisor
+        mode: "0755"
+
+    - name: Install openshell CLI (static musl binary)
+      # RHEL 9 ships glibc 2.34, but the PyPI wheel (manylinux_2_39) and the
+      # fc44 RPM require glibc 2.39. The statically-linked musl build has no
+      # libc dependency and runs on any x86_64/aarch64 Linux, so it is the
+      # portable, reproducible way to install the CLI on this golden image.
+      block:
+        # The play runs with gather_facts:false, so ansible_architecture is not
+        # available. uname -m returns x86_64/aarch64 — exactly the arch names in
+        # OpenShell's release triples — so derive it explicitly and cheaply.
+        - name: Determine target architecture
+          ansible.builtin.command: uname -m
+          register: openshell_uname_arch
+          changed_when: false
+
+        - name: Download openshell CLI release tarball (checksum-verified)
+          ansible.builtin.get_url:
+            url: "https://github.com/NVIDIA/OpenShell/releases/download/v{{ openshell_version }}/openshell-{{ openshell_uname_arch.stdout }}-unknown-linux-musl.tar.gz"
+            dest: "/tmp/openshell-{{ openshell_version }}-{{ openshell_uname_arch.stdout }}.tar.gz"
+            checksum: "sha256:https://github.com/NVIDIA/OpenShell/releases/download/v{{ openshell_version }}/openshell-checksums-sha256.txt"
+            mode: "0644"
+          register: openshell_cli_download
+
+        - name: Install openshell CLI to /usr/local/bin
+          ansible.builtin.unarchive:
+            src: "{{ openshell_cli_download.dest }}"
+            dest: /usr/local/bin
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Verify openshell CLI runs
+          ansible.builtin.command: /usr/local/bin/openshell --version
+          changed_when: false
+
+    # === [4/8] Gateway user config (env, GRPC endpoint, TLS) ===
+    - name: Ensure user openshell config dir
+      ansible.builtin.file:
+        path: "{{ user_home }}/.config/openshell"
+        state: directory
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0755"
+
+    - name: Derive podman bridge gateway IP
+      ansible.builtin.command: "podman network inspect podman --format {{ '{{(index .Subnets 0).Gateway}}' }}"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      register: podman_gw
+      changed_when: false
+      failed_when: false
+
+    - name: Set runtime gateway fact
+      ansible.builtin.set_fact:
+        runtime_gw: "{{ podman_gw.stdout if (podman_gw.stdout is defined and podman_gw.stdout | length > 0) else '10.88.0.1' }}"
+
+    - name: Write user gateway.env with GRPC endpoint
+      ansible.builtin.copy:
+        dest: "{{ user_home }}/.config/openshell/gateway.env"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0644"
+        content: |
+          OPENSHELL_BIND_ADDRESS=0.0.0.0
+          OPENSHELL_SERVER_PORT=17670
+          OPENSHELL_DRIVERS=podman
+          OPENSHELL_SSH_GATEWAY_PORT=17670
+          OPENSHELL_TLS_CERT={{ user_home }}/.local/state/openshell/tls/server/tls.crt
+          OPENSHELL_TLS_KEY={{ user_home }}/.local/state/openshell/tls/server/tls.key
+          OPENSHELL_TLS_CLIENT_CA={{ user_home }}/.local/state/openshell/tls/ca.crt
+          OPENSHELL_CONFIG_FILE=/etc/openshell/gateway.toml
+          OPENSHELL_ENABLE_MTLS_AUTH=true
+          OPENSHELL_GRPC_ENDPOINT=https://{{ runtime_gw }}:17670
+          OPENSHELL_SSH_GATEWAY_HOST={{ runtime_gw }}
+          OPENSHELL_PODMAN_SOCKET=/run/user/{{ user_uid }}/podman/podman.sock
+
+    - name: Copy bootstrap gateway config to user config
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/openshell/gateway.toml
+        dest: "{{ user_home }}/.config/openshell/gateway.toml"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0644"
+
+    # Bootstrap without OIDC so the generated local mTLS identity can be
+    # persisted as a workspace administrator before final authentication starts.
+    - name: Start gateway in mTLS bootstrap mode
+      ansible.builtin.systemd:
+        name: openshell-gateway.service
+        scope: user
+        enabled: true
+        state: restarted
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+
+    - name: Wait for mTLS bootstrap gateway to become active
+      ansible.builtin.command: "systemctl --user is-active openshell-gateway.service"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      register: gw_active
+      until: gw_active.rc == 0
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Remove stale mTLS bootstrap gateway registration
+      ansible.builtin.command: "openshell gateway remove {{ mtls_gw }}"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Register mTLS bootstrap gateway
+      ansible.builtin.command: "openshell gateway add https://127.0.0.1:17670 --name {{ mtls_gw }} --local"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      changed_when: true
+
+    - name: Select mTLS bootstrap gateway
+      ansible.builtin.command: "openshell gateway select {{ mtls_gw }}"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      changed_when: false
+
+    - name: Inspect existing openshell-client workspace membership
+      ansible.builtin.command: "openshell workspace member list --workspace default"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      register: bootstrap_workspace_members
+      changed_when: false
+      until: bootstrap_workspace_members.rc == 0
+      retries: 20
+      delay: 3
+
+    - name: Grant openshell-client workspace admin
+      ansible.builtin.command: "openshell workspace member add --workspace default --subject openshell-client --role admin"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      when: bootstrap_workspace_members.stdout is not search('(?m)^openshell-client\s+admin$')
+      changed_when: true
+
+    - name: Write final OIDC gateway config
+      ansible.builtin.copy:
+        dest: /etc/openshell/gateway.toml
+        mode: "0644"
+        content: |
+          [openshell.gateway.oidc]
+          issuer = "{{ oidc_issuer }}"
+          audience = "{{ oidc_client_id }}"
+
+          [openshell.gateway.auth]
+          allow_unauthenticated_users = false
+
+          [openshell.drivers.podman]
+          enable_bind_mounts = true
+          {% if inference_https_proxy_cfg | length > 0 %}
+          https_proxy = "{{ inference_https_proxy_cfg }}"
+          {% endif %}
+
+    - name: Copy final gateway config to user config
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/openshell/gateway.toml
+        dest: "{{ user_home }}/.config/openshell/gateway.toml"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0644"
+
+    - name: Ensure final OIDC gateway metadata dir
+      ansible.builtin.file:
+        path: "{{ user_home }}/.config/openshell/gateways/{{ gw_name }}"
+        state: directory
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0755"
+
+    - name: Write final OIDC gateway metadata
+      ansible.builtin.copy:
+        dest: "{{ user_home }}/.config/openshell/gateways/{{ gw_name }}/metadata.json"
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: "0644"
+        content: |
+          {"name":"{{ gw_name }}","gateway_endpoint":"https://127.0.0.1:17670","is_remote":false,"gateway_port":17670,"auth_mode":"oidc","oidc_issuer":"{{ oidc_issuer }}","oidc_client_id":"{{ oidc_client_id }}","oidc_audience":"{{ oidc_client_id }}"}
+
+    - name: Restart gateway in final OIDC mode
+      ansible.builtin.systemd:
+        name: openshell-gateway.service
+        scope: user
+        enabled: true
+        state: restarted
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+
+    - name: Wait for final OIDC gateway to become active
+      ansible.builtin.command: "systemctl --user is-active openshell-gateway.service"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      register: gateway_final_active
+      until: gateway_final_active.rc == 0
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Reselect authorized mTLS gateway
+      ansible.builtin.command: "openshell gateway select {{ mtls_gw }}"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      changed_when: false
+
+    - name: Verify authorized mTLS workspace access
+      ansible.builtin.command: "openshell workspace member list --workspace default"
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      register: final_workspace_members
+      changed_when: false
+      until: >-
+        final_workspace_members.rc == 0 and
+        final_workspace_members.stdout is search('(?m)^openshell-client\s+admin$')
+      retries: 20
+      delay: 3
+
+    # Sandbox: gateway registration, provider, and OpenClaw services
+    - name: Sandbox + openclaw setup
+      become_user: "{{ user_name }}"
+      environment: "{{ user_env }}"
+      block:
+        - name: Enable providers_v2
+          ansible.builtin.command: "openshell settings set --global --key providers_v2_enabled --value true --yes"
+          changed_when: true
+          failed_when: false
+
+        - name: Inspect configured inference provider
+          ansible.builtin.command: "openshell provider get {{ inference_provider_name }}"
+          register: inference_provider_state
+          changed_when: false
+          failed_when: false
+
+        - name: Create configured inference provider
+          ansible.builtin.command: >
+            openshell provider create
+            --name {{ inference_provider_name }}
+            --type {{ provider_sel.type }}
+            --credential {{ provider_sel.key }}
+            {% if provider_sel.type == 'openai' %}
+            --config OPENAI_BASE_URL={{ inference_endpoint_url_cfg }}
+            {% endif %}
+          environment: "{{ user_env | combine({provider_sel.key: inference_api_key_cfg}) }}"
+          when:
+            - inference_provider_cfg | length > 0
+            - inference_api_key_cfg | length > 0
+            - provider_sel.key | length > 0
+            - inference_provider_state.rc != 0
+          changed_when: true
+          no_log: true
+
+        - name: Rotate configured inference provider credential
+          ansible.builtin.command: >
+            openshell provider update {{ inference_provider_name }}
+            --credential {{ provider_sel.key }}
+            {% if provider_sel.type == 'openai' %}
+            --config OPENAI_BASE_URL={{ inference_endpoint_url_cfg }}
+            {% endif %}
+          environment: "{{ user_env | combine({provider_sel.key: inference_api_key_cfg}) }}"
+          when:
+            - inference_provider_cfg | length > 0
+            - inference_api_key_cfg | length > 0
+            - provider_sel.key | length > 0
+            - inference_provider_state.rc == 0
+          changed_when: true
+          no_log: true
+
+        - name: Select configured model as managed inference default
+          ansible.builtin.command: >
+            openshell inference set
+            --provider {{ inference_provider_name }}
+            --model {{ inference_model_cfg }}
+            --no-verify
+          changed_when: true
+
+        - name: Verify trusted openclaw sandbox image
+          ansible.builtin.command: "podman image exists {{ trusted_sandbox_image_cfg }}"
+          changed_when: false
+
+        - name: Ensure user OpenClaw runtime dirs exist
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ user_home }}/.config/systemd/user"
+            - "{{ user_home }}/.local/bin"
+
+        - name: Remove retired OpenClaw bearer-token environment
+          ansible.builtin.file:
+            path: "{{ user_home }}/.config/openshell/openclaw.env"
+            state: absent
+
+        # Stop both generations of the service before cleanup. The forward unit
+        # does not exist on older deployments, so an absent unit is harmless.
+        - name: Stop existing openclaw services
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            scope: user
+            state: stopped
+          loop:
+            - openclaw-auth-proxy.service
+            - openclaw-forward.service
+            - openclaw-gateway.service
+            - openclaw-sandbox.service
+          failed_when: false
+
+        # Persistence: do not delete an existing sandbox during normal
+        # provisioning. The sandbox writable layer is stored under the persisted
+        # rootless Podman storage, so deleting the sandbox would discard
+        # OpenClaw's /sandbox state.
+        - name: Inspect existing OpenClaw sandbox
+          ansible.builtin.command: "openshell sandbox list"
+          register: openclaw_existing_sandboxes
+          changed_when: false
+          failed_when: false
+
+        # OpenShell replaces the OCI entrypoint with its supervisor and treats the
+        # command passed to `sandbox create` as a saw-agent-shot exec. Create a durable
+        # Ready sandbox first; a dependent unit starts OpenClaw through sandbox
+        # exec on every VM boot. This follows secure-agent-workspace PR #34.
+        - name: Write OpenClaw sandbox ensure script
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.local/bin/ensure-openclaw-sandbox"
+            mode: "0755"
+            content: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              export OPENSHELL_GATEWAY=openshell-local
+              export NO_COLOR=1
+              driver_config_json='{"podman":{"mounts":[{"type":"bind","source":"{{ openclaw_home_host_path }}","target":"/sandbox/.openclaw","read_only":false,"selinux_label":"shared"}]}}'
+
+              sandbox_state=""
+              sandbox_list_ready=false
+              for attempt in $(/usr/bin/seq 1 30); do
+                if sandbox_state="$(
+                  /usr/local/bin/openshell sandbox list \
+                    | /usr/bin/awk 'NR>1 && $1=="{{ sandbox_name }}" {print $NF; exit}'
+                )"; then
+                  sandbox_list_ready=true
+                  break
+                fi
+                /usr/bin/sleep 2
+              done
+
+              if [ "${sandbox_list_ready}" != "true" ]; then
+                echo "OpenShell gateway was not ready after waiting for sandbox list" >&2
+                exit 1
+              fi
+
+              if [ "${sandbox_state}" = "Ready" ]; then
+                exit 0
+              fi
+
+              if [ -n "${sandbox_state}" ]; then
+                for attempt in $(/usr/bin/seq 1 10); do
+                  if /usr/local/bin/openshell sandbox delete {{ sandbox_name }}; then
+                    break
+                  fi
+                  /usr/bin/sleep 3
+                done
+
+                /usr/bin/podman ps -a --format '{{ "{{" }}.ID{{ "}}" }} {{ "{{" }}.Names{{ "}}" }}' \
+                  | /usr/bin/awk '$2 ~ /^openshell-default--{{ sandbox_name }}-/ {print $1}' \
+                  | /usr/bin/xargs -r /usr/bin/podman rm -f || true
+              fi
+
+              for attempt in $(/usr/bin/seq 1 3); do
+                if [ "${attempt}" -eq 3 ]; then
+                  exec /usr/local/bin/openshell sandbox create \
+                    --name {{ sandbox_name }} \
+                    --from {{ trusted_sandbox_image_cfg }} \
+                    --policy {{ playbook_dir }}/files/openclaw-policy.yml \
+                    --driver-config-json "${driver_config_json}" \
+                    --no-tty \
+                    --memory 12Gi \
+                    --provider {{ inference_provider_name }} \
+                    -- /bin/sh -c "echo sandbox-ready"
+                fi
+
+                /usr/local/bin/openshell sandbox create \
+                  --name {{ sandbox_name }} \
+                  --from {{ trusted_sandbox_image_cfg }} \
+                  --policy {{ playbook_dir }}/files/openclaw-policy.yml \
+                  --driver-config-json "${driver_config_json}" \
+                  --no-tty \
+                  --memory 12Gi \
+                  --provider {{ inference_provider_name }} \
+                  -- /bin/sh -c "echo sandbox-ready" && exit 0
+                /usr/bin/sleep 5
+              done
+
+        - name: Write openclaw sandbox systemd user unit
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.config/systemd/user/openclaw-sandbox.service"
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=OpenClaw gateway (openshell-managed sandbox)
+
+              [Service]
+              Type=oneshot
+              Environment=OPENSHELL_GATEWAY=openshell-local
+              Environment=NO_COLOR=1
+              ExecStart=%h/.local/bin/ensure-openclaw-sandbox
+              RemainAfterExit=true
+              TimeoutStopSec=60s
+
+              [Install]
+              WantedBy=default.target
+
+        - name: Write reference-aligned OpenClaw launch script
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.local/bin/start-openclaw-gateway"
+            mode: "0755"
+            content: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              export OPENSHELL_GATEWAY=openshell-local
+
+              exec /usr/local/bin/openshell sandbox exec \
+                --name {{ sandbox_name }} \
+                --no-tty \
+                --env CUSTOM_API_KEY=proxy-managed \
+                -- /bin/sh -c '
+                  set -eu
+                  export HOME=/sandbox
+                  export OPENCLAW_HOME=/sandbox
+                  export SQLITE_TMPDIR=/sandbox/.openclaw/state
+                  export TMPDIR=/sandbox/.openclaw/state
+                  export OPENCLAW_NIX_MODE=0
+                  mkdir -p /sandbox/.openclaw/state
+
+                  openclaw onboard \
+                    --non-interactive \
+                    --accept-risk \
+                    --mode local \
+                    --auth-choice custom-api-key \
+                    --custom-base-url "https://inference.local/v1" \
+                    --custom-provider-id "{{ inference_provider_cfg }}" \
+                    --custom-model-id "{{ inference_model_cfg }}" \
+                    --custom-compatibility openai \
+                    --skip-channels \
+                    --skip-health
+
+                  if [ "{{ provider_sel.type }}" = "openai" ]; then
+                    printf %s "{{ openclaw_known_model_patch_b64 }}" \
+                      | base64 -d >/tmp/openclaw-known-model.json
+                    openclaw config patch \
+                      --file /tmp/openclaw-known-model.json
+                  fi
+
+                  printf %s "{{ openclaw_trusted_proxy_patch_b64 }}" \
+                    | base64 -d >/tmp/openclaw-trusted-proxy.json
+                  openclaw config unset gateway.auth.token || true
+                  openclaw config patch \
+                    --file /tmp/openclaw-trusted-proxy.json
+                  openclaw config validate --json
+
+                  nohup openclaw gateway run \
+                    --allow-unconfigured \
+                    --bind lan \
+                    --port {{ openclaw_forward_port_cfg }} \
+                    >/tmp/openclaw-gateway.log 2>&1 </dev/null &
+                ' </dev/null
+
+        - name: Write openclaw gateway systemd user unit
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.config/systemd/user/openclaw-gateway.service"
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=OpenClaw gateway process inside OpenShell sandbox
+              Requires=openclaw-sandbox.service
+              After=openclaw-sandbox.service
+              PartOf=openclaw-sandbox.service
+
+              [Service]
+              Type=oneshot
+              ExecStart=%h/.local/bin/start-openclaw-gateway
+              RemainAfterExit=true
+
+              [Install]
+              WantedBy=default.target
+
+        - name: Write openclaw foreground forward systemd user unit
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.config/systemd/user/openclaw-forward.service"
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=OpenClaw host port forward
+              Requires=openclaw-gateway.service
+              After=openclaw-gateway.service
+              PartOf=openclaw-sandbox.service
+              StartLimitIntervalSec=0
+
+              [Service]
+              Type=simple
+              Environment=OPENSHELL_GATEWAY=openshell-local
+              ExecStart=/usr/local/bin/openshell forward start 127.0.0.1:{{ openclaw_forward_port_cfg }} {{ sandbox_name }}
+              Restart=on-failure
+              RestartSec=3s
+
+              [Install]
+              WantedBy=default.target
+
+        - name: Generate persistent OpenClaw proxy cookie secret
+          ansible.builtin.command: >-
+            openssl rand -out
+            {{ user_home }}/.config/openshell/openclaw-proxy-cookie-secret 32
+          args:
+            creates: "{{ user_home }}/.config/openshell/openclaw-proxy-cookie-secret"
+          when: openclaw_proxy_enabled_cfg | bool
+
+        - name: Protect OpenClaw proxy cookie secret
+          ansible.builtin.file:
+            path: "{{ user_home }}/.config/openshell/openclaw-proxy-cookie-secret"
+            mode: "0600"
+          when: openclaw_proxy_enabled_cfg | bool
+
+        - name: Install optional Keycloak private CA
+          ansible.builtin.copy:
+            dest: /etc/pki/ca-trust/source/anchors/saw-keycloak-ca.crt
+            mode: "0644"
+            content: "{{ keycloak_ca_pem_cfg }}"
+          when:
+            - openclaw_proxy_enabled_cfg | bool
+            - keycloak_ca_pem_cfg | length > 0
+
+        - name: Update system trust for optional Keycloak private CA
+          ansible.builtin.command: update-ca-trust
+          changed_when: true
+          when:
+            - openclaw_proxy_enabled_cfg | bool
+            - keycloak_ca_pem_cfg | length > 0
+
+        # oauth2-proxy runs as UID 65532, so it cannot read a rootless bind
+        # mount of the service account's mode-0600 file. Slurp preserves the
+        # same 32 random bytes as base64, which oauth2-proxy accepts directly.
+        - name: Read persistent OpenClaw proxy cookie secret
+          ansible.builtin.slurp:
+            src: "{{ user_home }}/.config/openshell/openclaw-proxy-cookie-secret"
+          register: openclaw_proxy_cookie_secret
+          no_log: true
+          when: openclaw_proxy_enabled_cfg | bool
+
+        - name: Write OpenClaw auth proxy environment
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.config/openshell/openclaw-proxy.env"
+            mode: "0600"
+            content: |
+              OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:{{ openclaw_proxy_port_cfg }}
+              OAUTH2_PROXY_UPSTREAMS=http://127.0.0.1:{{ openclaw_forward_port_cfg }}
+              OAUTH2_PROXY_PROVIDER=oidc
+              OAUTH2_PROXY_OIDC_ISSUER_URL={{ oidc_issuer }}
+              OAUTH2_PROXY_CLIENT_ID={{ oidc_client_id }}
+              OAUTH2_PROXY_CLIENT_SECRET_FILE=/dev/null
+              OAUTH2_PROXY_REDIRECT_URL={{ openclaw_proxy_redirect_url_cfg }}
+              OAUTH2_PROXY_COOKIE_SECRET={{ openclaw_proxy_cookie_secret.content | replace('+', '-') | replace('/', '_') }}
+              OAUTH2_PROXY_COOKIE_NAME=_oauth2_proxy_openclaw
+              OAUTH2_PROXY_CODE_CHALLENGE_METHOD=S256
+              OAUTH2_PROXY_USER_ID_CLAIM=preferred_username
+              OAUTH2_PROXY_PASS_USER_HEADERS=true
+              OAUTH2_PROXY_PASS_ACCESS_TOKEN=false
+              OAUTH2_PROXY_SKIP_AUTH_STRIP_HEADERS=true
+              OAUTH2_PROXY_EMAIL_DOMAINS=*
+              OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true
+              OAUTH2_PROXY_COOKIE_SECURE=true
+              OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL=true
+              OAUTH2_PROXY_SCOPE=openid email profile
+              OAUTH2_PROXY_COOKIE_REFRESH=60s
+          no_log: true
+          when: openclaw_proxy_enabled_cfg | bool
+
+        - name: Write OpenClaw auth proxy systemd user unit
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.config/systemd/user/openclaw-auth-proxy.service"
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Keycloak-authenticated OpenClaw proxy
+              Requires=openclaw-forward.service
+              After=openclaw-forward.service
+              PartOf=openclaw-sandbox.service
+
+              [Service]
+              Type=simple
+              ExecStartPre=-/usr/bin/podman rm -f openclaw-auth-proxy
+              ExecStart=/usr/bin/podman run --rm --name openclaw-auth-proxy --network host --env-file=%h/.config/openshell/openclaw-proxy.env -e SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt -v /etc/pki/tls/certs/ca-bundle.crt:/etc/pki/tls/certs/ca-bundle.crt:ro {{ openclaw_proxy_image_cfg }}
+              ExecStop=/usr/bin/podman stop -t 5 openclaw-auth-proxy
+              Restart=on-failure
+              RestartSec=5s
+
+              [Install]
+              WantedBy=default.target
+          when: openclaw_proxy_enabled_cfg | bool
+
+        - name: Enable + start openclaw services with diagnostics
+          block:
+            - name: Start openclaw services
+              ansible.builtin.systemd:
+                name: "{{ item }}"
+                scope: user
+                enabled: true
+                state: started
+                daemon_reload: true
+              register: openclaw_service_start
+              failed_when: false
+              loop:
+                - openclaw-sandbox.service
+                - openclaw-gateway.service
+                - openclaw-forward.service
+
+            - name: Verify openclaw services are active
+              ansible.builtin.command: >-
+                systemctl --user is-active
+                openclaw-sandbox.service
+                openclaw-gateway.service
+                openclaw-forward.service
+              register: openclaw_services_active
+              changed_when: false
+              failed_when: openclaw_services_active.rc != 0
+          rescue:
+            - name: Read OpenClaw user service status
+              ansible.builtin.command: >-
+                systemctl --user status
+                openclaw-sandbox.service
+                openclaw-gateway.service
+                openclaw-forward.service
+                --no-pager -l
+              register: openclaw_user_service_status
+              changed_when: false
+              failed_when: false
+
+            - name: Read OpenClaw user service journal
+              ansible.builtin.command: >-
+                journalctl --user
+                -u openclaw-sandbox.service
+                -u openclaw-gateway.service
+                -u openclaw-forward.service
+                -n 160 --no-pager -o cat
+              register: openclaw_user_service_journal
+              changed_when: false
+              failed_when: false
+
+            - name: Inspect OpenClaw sandbox list after service start failure
+              ansible.builtin.command: openshell sandbox list
+              register: openclaw_service_failure_sandboxes
+              changed_when: false
+              failed_when: false
+
+            - name: Display OpenClaw user service status
+              ansible.builtin.debug:
+                var: openclaw_user_service_status.stdout_lines
+
+            - name: Display OpenClaw user service journal
+              ansible.builtin.debug:
+                var: openclaw_user_service_journal.stdout_lines
+
+            - name: Display OpenClaw sandbox list after service start failure
+              ansible.builtin.debug:
+                var: openclaw_service_failure_sandboxes.stdout_lines
+
+            - name: Fail provisioning after OpenClaw service diagnostics
+              ansible.builtin.fail:
+                msg: OpenClaw user services failed to start; see diagnostics above.
+
+        - name: Enable + start OpenClaw auth proxy
+          ansible.builtin.systemd:
+            name: openclaw-auth-proxy.service
+            scope: user
+            enabled: true
+            state: started
+            daemon_reload: true
+          when: openclaw_proxy_enabled_cfg | bool
+
+        - name: Verify OpenClaw auth proxy readiness with diagnostics
+          when: openclaw_proxy_enabled_cfg | bool
+          block:
+            - name: Wait for OpenClaw auth proxy readiness
+              ansible.builtin.uri:
+                url: "http://127.0.0.1:{{ openclaw_proxy_port_cfg }}/ready"
+                status_code: [200]
+              register: openclaw_proxy_health
+              until: openclaw_proxy_health.status == 200
+              retries: 20
+              delay: 3
+          rescue:
+            - name: Read OpenClaw auth proxy systemd journal
+              ansible.builtin.command: >-
+                journalctl --user -u openclaw-auth-proxy.service
+                -n 100 --no-pager -o cat
+              register: openclaw_proxy_log
+              changed_when: false
+              failed_when: false
+
+            - name: Display OpenClaw auth proxy failure log
+              ansible.builtin.debug:
+                var: openclaw_proxy_log.stdout_lines
+
+            - name: Fail provisioning after auth proxy diagnostics
+              ansible.builtin.fail:
+                msg: >-
+                  OpenClaw auth proxy did not become ready on port
+                  {{ openclaw_proxy_port_cfg }}.
+
+        - name: Verify openclaw gateway health with failure diagnostics
+          block:
+            - name: Wait for openclaw gateway health through raw localhost forward
+              ansible.builtin.uri:
+                url: http://127.0.0.1:{{ openclaw_forward_port_cfg }}/health
+                status_code: [200]
+                return_content: true
+              register: openclaw_health
+              until: openclaw_health.status == 200 and 'ok' in (openclaw_health.content | default(''))
+              retries: 30
+              delay: 5
+          rescue:
+            - name: Read OpenClaw gateway log from sandbox
+              ansible.builtin.command: >-
+                openshell sandbox exec --name {{ sandbox_name }} --no-tty --
+                /bin/sh -c 'cat /tmp/openclaw-gateway.log 2>/dev/null || true'
+              register: openclaw_gateway_log
+              changed_when: false
+              failed_when: false
+
+            - name: Display OpenClaw gateway failure log
+              ansible.builtin.debug:
+                var: openclaw_gateway_log.stdout_lines
+
+            - name: Fail provisioning after OpenClaw diagnostics
+              ansible.builtin.fail:
+                msg: >-
+                  OpenClaw gateway did not become healthy on raw localhost
+                  forward port {{ openclaw_forward_port_cfg }}.
+
+    - name: Provisioning complete
+      ansible.builtin.debug:
+        msg: "Setup complete: sandbox={{ sandbox_name }} agent=openclaw provider={{ inference_provider_cfg | default('none') }}"

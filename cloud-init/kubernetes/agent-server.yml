@@ -1,0 +1,91 @@
+apiVersion: cirrus.ibm.com/v1alpha1
+kind: Server
+metadata:
+  name: saw-agent
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/name: secure-agent-workspace
+    app.kubernetes.io/component: saw-agent
+spec:
+  cloudInit:
+    userData: |
+      #cloud-config
+      name: cloudinitdisk
+      hostname: saw-agent
+      users:
+        - default
+        - name: openshell
+          gecos: OpenShell service account
+          lock_passwd: true
+          shell: /bin/bash
+      runcmd:
+        - |
+          set -eu
+          install -d -m 0750 /etc/openshell-saw
+          vars_device=""
+          for attempt in 1 2 3 4 5; do
+            vars_device="$(lsblk -rpno NAME,SERIAL | awk '$2=="VARS01"{print $1;exit}')"
+            if [ -n "${vars_device}" ]; then
+              break
+            fi
+            sleep 10
+          done
+          test -n "${vars_device}"
+          mount "${vars_device}" /etc/openshell-saw
+          checkout=/opt/secure-agent-workspace
+          install -d -m 0755 "${checkout}"
+          # Gist-based bootstrap is deprecated; use this versioned repository branch.
+          curl -fsSL --retry 5 --retry-delay 10 \
+            https://github.com/cooktheryan/secure-agent-workspace/archive/refs/heads/feat/openclaw-demo-alignment.tar.gz \
+            | tar -xz --strip-components=1 -C "${checkout}"
+          usermod --add-subuids 100000-165535 --add-subgids 100000-165535 openshell 2>/dev/null || true
+          install -m 0755 "${checkout}/cloud-init/files/saw-provision-debug-server.py" /usr/local/sbin/saw-provision-debug-server
+          cat >/etc/systemd/system/saw-provision-log-http.service <<'UNIT'
+          [Unit]
+          Description=SAW provisioning diagnostic HTTP endpoint
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/sbin/saw-provision-debug-server
+          Restart=on-failure
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now saw-provision-log-http.service
+          systemd-run --unit=saw-provision.service --setenv=HOME=/root /usr/bin/bash -c 'exec /usr/bin/ansible-playbook -i localhost, /opt/secure-agent-workspace/cloud-init/ansible/site.yml -e @/etc/openshell-saw/vars.yml > /var/log/saw-provision.log 2>&1'
+  containerDiskImage: registry.cirrus.ibm.com/mici-golden-images/cirrus-rhel-9-golden-image:master-e4b3a21-20260707-093716
+  operatingSystem: ""
+  profile: c4.m24
+  running: true
+  ports:
+    - name: userport
+      port: 18789
+      protocol: TCP
+    - name: forgeui
+      port: 18090
+      protocol: TCP
+    - name: provisionlog
+      port: 18080
+      protocol: TCP
+  mounts:
+    - name: vars-secret
+      serial: VARS01
+      volume:
+        secret:
+          secretName: saw-agent-vars
+    - name: persistent-state
+      serial: SAWAGENTSTATE
+      volume:
+        persistentVolumeClaim:
+          claimName: saw-agent-state-persist
+          readOnly: false
+    - name: persistent-assets
+      serial: SAWAGENTASSETS
+      volume:
+        persistentVolumeClaim:
+          claimName: saw-agent-assets-persist
+          readOnly: false

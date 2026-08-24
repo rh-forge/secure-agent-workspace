@@ -1,0 +1,19 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: saw-agent-userport
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/name: secure-agent-workspace
+    app.kubernetes.io/component: saw-agent
+spec:
+  host: saw-agent-userport.${NS}.dal.dev.cirrus.ibm.com
+  port:
+    targetPort: userport
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: saw-agent
+    weight: 100
